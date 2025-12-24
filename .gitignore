@@ -13,3 +13,16 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Local library source (using JitPack version instead)
+/jcussdlib/
+
+# IDE files
+/.idea/
+
+# Documentation files
+/BUILD_AND_TEST_GUIDE.md
+/INTEGRATION_COMPLETE.md
+
+# Temp files
+nul
