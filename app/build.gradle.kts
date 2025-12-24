@@ -44,8 +44,8 @@ dependencies {
     implementation(libs.recyclerview)
     implementation(libs.cardview)
 
-    // JCUSSDLib for USSD processing
-    implementation("com.github.mugishajc:JCUSSDLib:2.0.0")
+    // JCUSSDLib for USSD processing (latest version)
+    implementation("com.github.mugishajc:JCUSSDLib:+")
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.ext.junit)
